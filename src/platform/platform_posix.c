@@ -194,7 +194,6 @@ CxPlatSystemLoad(
     // Load the tracepoint provider.
     // It's OK if this fails - that just means that tracing dependencies aren't available.
     //
-    dlopen(ProviderFullPath, RTLD_NOW | RTLD_GLOBAL);
 
     CXPLAT_FREE(ProviderFullPath, QUIC_POOL_PLATFORM_TMP_ALLOC);
 
