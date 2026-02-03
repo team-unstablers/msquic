@@ -510,6 +510,7 @@ TEST_P(WithValidateTlsConfigArgs, ValidateTlsConfig) {
             &Arg.CertFile,
             &Arg.CertFileProtected,
             &Arg.Pkcs12,
+            &Arg.Pem,
             NULL));
     Arg.CredConfig.Flags =
         GetParam().CertType == CXPLAT_TEST_CERT_SELF_SIGNED_CLIENT ?
@@ -526,6 +527,43 @@ TEST_P(WithValidateTlsConfigArgs, ValidateTlsConfig) {
 
     CxPlatFreeTestCert(&Arg.CredConfig);
 }
+
+#ifndef _WIN32
+TEST(ParameterValidation, ValidatePemCredentialConfig) {
+    TestLogger Logger("QuicTestValidatePemCredentialConfig");
+    if (TestingKernelMode) {
+        GTEST_SKIP_("PEM credentials not supported in kernel mode");
+    }
+
+    MsQuicRegistration Registration;
+    ASSERT_TRUE(Registration.IsValid());
+
+    MsQuicConfiguration Configuration(Registration, "MsQuicTest");
+    ASSERT_TRUE(Configuration.IsValid());
+
+    QUIC_CERTIFICATE_PEM Pem;
+    QUIC_CREDENTIAL_CONFIG CredConfig;
+    CxPlatZeroMemory(&Pem, sizeof(Pem));
+    CxPlatZeroMemory(&CredConfig, sizeof(CredConfig));
+
+    CredConfig.Type = QUIC_CREDENTIAL_TYPE_CERTIFICATE_PEM;
+    CredConfig.CertificatePem = &Pem;
+
+    EXPECT_EQ(QUIC_STATUS_INVALID_PARAMETER, Configuration.LoadCredential(&CredConfig));
+
+    static const uint8_t Dummy = 'x';
+
+    Pem.CertificatePem = &Dummy;
+    Pem.CertificatePemLength = 1;
+    EXPECT_EQ(QUIC_STATUS_INVALID_PARAMETER, Configuration.LoadCredential(&CredConfig));
+
+    Pem.CertificatePem = NULL;
+    Pem.CertificatePemLength = 0;
+    Pem.PrivateKeyPem = &Dummy;
+    Pem.PrivateKeyPemLength = 1;
+    EXPECT_EQ(QUIC_STATUS_INVALID_PARAMETER, Configuration.LoadCredential(&CredConfig));
+}
+#endif
 
 TEST(Basic, CreateListener) {
     TestLogger Logger("QuicTestCreateListener");
@@ -1271,6 +1309,7 @@ TEST(CredValidation, ConnectExpiredServerCertificate) {
             NULL,
             NULL,
             NULL,
+            NULL,
             (char*)Params.PrincipalString));
         if (TestingKernelMode) {
             ASSERT_TRUE(DriverClient.Run(IOCTL_QUIC_RUN_EXPIRED_SERVER_CERT, Params));
@@ -1295,6 +1334,7 @@ TEST(CredValidation, ConnectExpiredServerCertificate) {
             NULL,
             NULL,
             NULL,
+            NULL,
             (char*)Params.PrincipalString));
         QuicTestConnectExpiredServerCertificate(&Params.CredConfig);
         CxPlatFreeTestCert((QUIC_CREDENTIAL_CONFIG*)&Params.CredConfig);
@@ -1313,6 +1353,7 @@ TEST(CredValidation, ConnectValidServerCertificate) {
             &Params.CredConfig,
             &Params.CertHash,
             &Params.CertHashStore,
+            NULL,
             NULL,
             NULL,
             NULL,
@@ -1339,6 +1380,7 @@ TEST(CredValidation, ConnectValidServerCertificate) {
             NULL,
             NULL,
             NULL,
+            NULL,
             (char*)Params.PrincipalString));
         QuicTestConnectValidServerCertificate(&Params.CredConfig);
         CxPlatFreeTestCert((QUIC_CREDENTIAL_CONFIG*)&Params.CredConfig);
@@ -1357,6 +1399,7 @@ TEST(CredValidation, ConnectExpiredClientCertificate) {
             &Params.CredConfig,
             &Params.CertHash,
             &Params.CertHashStore,
+            NULL,
             NULL,
             NULL,
             NULL,
@@ -1386,6 +1429,7 @@ TEST(CredValidation, ConnectExpiredClientCertificate) {
             NULL,
             NULL,
             NULL,
+            NULL,
             (char*)Params.PrincipalString));
         Params.CredConfig.Flags =
             QUIC_CREDENTIAL_FLAG_CLIENT | QUIC_CREDENTIAL_FLAG_NO_CERTIFICATE_VALIDATION;
@@ -1412,6 +1456,7 @@ TEST(CredValidation, ConnectValidClientCertificate) {
             NULL,
             NULL,
             NULL,
+            NULL,
             (char*)Params.PrincipalString));
         Params.CredConfig.Flags =
             QUIC_CREDENTIAL_FLAG_CLIENT | QUIC_CREDENTIAL_FLAG_NO_CERTIFICATE_VALIDATION;
@@ -1435,6 +1480,7 @@ TEST(CredValidation, ConnectValidClientCertificate) {
             &Params.CredConfig,
             &Params.CertHash,
             &Params.CertHashStore,
+            NULL,
             NULL,
             NULL,
             NULL,
