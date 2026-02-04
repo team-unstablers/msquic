@@ -528,7 +528,7 @@ TEST_P(WithValidateTlsConfigArgs, ValidateTlsConfig) {
     CxPlatFreeTestCert(&Arg.CredConfig);
 }
 
-#ifndef _WIN32
+#ifdef QUIC_TEST_OPENSSL_FLAGS
 TEST(ParameterValidation, ValidatePemCredentialConfig) {
     TestLogger Logger("QuicTestValidatePemCredentialConfig");
     if (TestingKernelMode) {
@@ -563,7 +563,7 @@ TEST(ParameterValidation, ValidatePemCredentialConfig) {
     Pem.PrivateKeyPemLength = 1;
     EXPECT_EQ(QUIC_STATUS_INVALID_PARAMETER, Configuration.LoadCredential(&CredConfig));
 }
-#endif
+#endif // QUIC_TEST_OPENSSL_FLAGS
 
 TEST(Basic, CreateListener) {
     TestLogger Logger("QuicTestCreateListener");
