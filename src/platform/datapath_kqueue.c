@@ -675,6 +675,29 @@ CxPlatSocketContextInitialize(
     }
 
     //
+    // Disable SIGPIPE for socket sends.
+    //
+    Option = TRUE;
+    Result =
+        setsockopt(
+            SocketContext->SocketFd,
+            SOL_SOCKET,
+            SO_NOSIGPIPE,
+            (const void*)&Option,
+            sizeof(Option));
+    if (Result == SOCKET_ERROR) {
+        Status = errno;
+        QuicTraceEvent(
+            DatapathErrorStatus,
+            "[data][%p] ERROR, %u, %s.",
+            Binding,
+            Status,
+            "setsockopt(SO_NOSIGPIPE) failed");
+        goto Exit;
+    }
+
+
+    //
     // Set non blocking mode
     //
     Flags =
