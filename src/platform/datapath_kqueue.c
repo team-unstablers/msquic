@@ -380,6 +380,71 @@ typedef struct CXPLAT_DATAPATH {
 CXPLAT_EVENT_COMPLETION CxPlatSocketContextUninitializeEventComplete;
 CXPLAT_EVENT_COMPLETION CxPlatSocketContextIoEventComplete;
 
+static
+void
+CxPlatDataPathCalculateFeatureSupport(
+    _Inout_ CXPLAT_DATAPATH* Datapath
+    )
+{
+    Datapath->Features = 0;
+
+#if defined(IP_TOS) && defined(IPV6_TCLASS)
+    Datapath->Features |= CXPLAT_DATAPATH_FEATURE_SEND_DSCP;
+#endif
+
+#if defined(IP_RECVTOS) && defined(IPV6_RECVTCLASS)
+    Datapath->Features |= CXPLAT_DATAPATH_FEATURE_RECV_DSCP;
+#endif
+
+    //
+    // macOS can provide TTL ancillary data on family-specific sockets, but the
+    // current listener path still relies on dual-mode wildcard bindings that do
+    // not surface IPv4 TTL metadata. Keep TTL disabled until that dependency is
+    // addressed so feature advertising remains truthful.
+    //
+}
+
+static
+BOOLEAN
+CxPlatIsIpv4TtlCmsg(
+    _In_ int CMsgType
+    )
+{
+    return
+        CMsgType == IP_TTL
+#if defined(IP_RECVTTL)
+        || CMsgType == IP_RECVTTL
+#endif
+        ;
+}
+
+static
+BOOLEAN
+CxPlatIsIpv6HopLimitCmsg(
+    _In_ int CMsgType
+    )
+{
+    return
+        CMsgType == IPV6_HOPLIMIT
+#if defined(IPV6_RECVHOPLIMIT)
+        || CMsgType == IPV6_RECVHOPLIMIT
+#endif
+        ;
+}
+
+static
+int
+CxPlatGetTtlFromCmsg(
+    _In_ struct cmsghdr* CMsg
+    )
+{
+    if (CMsg->cmsg_len >= CMSG_LEN(sizeof(int))) {
+        return *(int*)CMSG_DATA(CMsg);
+    }
+
+    return *(uint8_t*)CMSG_DATA(CMsg);
+}
+
 QUIC_STATUS
 CxPlatSocketSendInternal(
     _In_ CXPLAT_SOCKET_CONTEXT* SocketContext,
@@ -474,6 +539,7 @@ CxPlatDataPathInitialize(
     Datapath->WorkerPool = WorkerPool;
     Datapath->PartitionCount = 1; //CxPlatWorkerPoolGetCount(WorkerPool); // Darwin only supports a single receiver
     CxPlatRefInitializeEx(&Datapath->RefCount, Datapath->PartitionCount);
+    CxPlatDataPathCalculateFeatureSupport(Datapath);
 
     for (uint32_t i = 0; i < Datapath->PartitionCount; i++) {
         CxPlatProcessorContextInitialize(
@@ -613,7 +679,9 @@ CxPlatSocketContextInitialize(
     int Result = 0;
     int Option = 0;
     int Flags = 0;
-    int ForceIpv4 = RemoteAddress && RemoteAddress->Ip.sa_family == QUIC_ADDRESS_FAMILY_INET;
+    int ForceIpv4 =
+        (LocalAddress != NULL && LocalAddress->Ip.sa_family == QUIC_ADDRESS_FAMILY_INET) ||
+        (RemoteAddress != NULL && RemoteAddress->Ip.sa_family == QUIC_ADDRESS_FAMILY_INET);
     QUIC_ADDR MappedAddress = {0};
     socklen_t AssignedLocalAddressLength = 0;
 
@@ -621,8 +689,8 @@ CxPlatSocketContextInitialize(
 
     //
     // Create datagram socket. We will use dual-mode sockets everywhere when we can.
-    // There is problem with receiving PKTINFO on dual-mode when binded and connect to IP4 endpoints.
-    // For that case we use AF_INET.
+    // There are issues with ancillary data on dual-mode sockets for IPv4 traffic,
+    // so IPv4 local/remote endpoints use AF_INET sockets directly.
     //
     SocketContext->SocketFd =
         socket(
@@ -788,6 +856,31 @@ CxPlatSocketContextInitialize(
             Status,
             "setsockopt(IPV6_RECVTCLASS) failed");
         goto Exit;
+    }
+
+    if (SocketContext->Binding->Datapath->Features & CXPLAT_DATAPATH_FEATURE_TTL) {
+        //
+        // Set socket option to receive hop limit / TTL information from the
+        // incoming packet.
+        //
+        Option = TRUE;
+        Result =
+            setsockopt(
+                SocketContext->SocketFd,
+                ForceIpv4 ? IPPROTO_IP : IPPROTO_IPV6,
+                ForceIpv4 ? IP_RECVTTL : IPV6_RECVHOPLIMIT,
+                (const void*)&Option,
+                sizeof(Option));
+        if (Result == SOCKET_ERROR) {
+            Status = errno;
+            QuicTraceEvent(
+                DatapathErrorStatus,
+                "[data][%p] ERROR, %u, %s.",
+                Binding,
+                Status,
+                "setsockopt(IPV6_RECVHOPLIMIT) failed");
+            goto Exit;
+        }
     }
 
     //
@@ -1099,7 +1192,10 @@ CxPlatSocketContextRecvComplete(
 
     BOOLEAN FoundLocalAddr = FALSE; // cppcheck-suppress unreadVariable
     BOOLEAN FoundTOS = FALSE; // cppcheck-suppress unreadVariable
+    BOOLEAN FoundTTL =
+        !(SocketContext->Binding->Datapath->Features & CXPLAT_DATAPATH_FEATURE_TTL);
     BOOLEAN FoundIfIdx = FALSE; // cppcheck-suppress unreadVariable
+    int HopLimitTTL = 0;
     QUIC_ADDR* LocalAddr = &RecvPacket->Route->LocalAddress;
     if (LocalAddr->Ipv6.sin6_family == AF_INET6) {
         LocalAddr->Ipv6.sin6_family = QUIC_ADDRESS_FAMILY_INET6;
@@ -1112,7 +1208,7 @@ CxPlatSocketContextRecvComplete(
 
     RecvPacket->Route->Queue = SocketContext;
     RecvPacket->TypeOfService = 0;
-    RecvPacket->HopLimitTTL = 0; // TODO: We are not supporting this on MacOS (yet) unless there's a business need.
+    RecvPacket->HopLimitTTL = 0;
 
     struct cmsghdr *CMsg;
     for (CMsg = CMSG_FIRSTHDR(&SocketContext->RecvMsgHdr);
@@ -1133,6 +1229,11 @@ CxPlatSocketContextRecvComplete(
             } else if (CMsg->cmsg_type == IPV6_TCLASS) {
                 RecvPacket->TypeOfService = *(uint8_t *)CMSG_DATA(CMsg);
                 FoundTOS = TRUE; // cppcheck-suppress unreadVariable
+            } else if (CxPlatIsIpv6HopLimitCmsg(CMsg->cmsg_type)) {
+                HopLimitTTL = CxPlatGetTtlFromCmsg(CMsg);
+                CXPLAT_DBG_ASSERT(HopLimitTTL < 256);
+                CXPLAT_DBG_ASSERT(HopLimitTTL > 0);
+                FoundTTL = TRUE;
             }
         } else if (CMsg->cmsg_level == IPPROTO_IP) {
 #if defined(IP_PKTINFO)
@@ -1166,13 +1267,20 @@ CxPlatSocketContextRecvComplete(
             else if (CMsg->cmsg_type == IP_TOS || CMsg->cmsg_type == IP_RECVTOS) {
                 RecvPacket->TypeOfService = *(uint8_t *)CMSG_DATA(CMsg);
                 FoundTOS = TRUE; // cppcheck-suppress unreadVariable
+            } else if (CxPlatIsIpv4TtlCmsg(CMsg->cmsg_type)) {
+                HopLimitTTL = CxPlatGetTtlFromCmsg(CMsg);
+                CXPLAT_DBG_ASSERT(HopLimitTTL < 256);
+                CXPLAT_DBG_ASSERT(HopLimitTTL > 0);
+                FoundTTL = TRUE;
             }
         }
     }
 
     CXPLAT_FRE_ASSERT(FoundLocalAddr);
     CXPLAT_FRE_ASSERT(FoundTOS);
+    CXPLAT_FRE_ASSERT(FoundTTL);
     CXPLAT_FRE_ASSERT(FoundIfIdx);
+    RecvPacket->HopLimitTTL = (uint8_t)HopLimitTTL;
 
     QuicTraceEvent(
         DatapathRecv,
@@ -1900,6 +2008,9 @@ CxPlatSocketSendInternal(
     QUIC_STATUS Status = QUIC_STATUS_SUCCESS;
     ssize_t SentByteCount = 0;
     QUIC_ADDR MappedRemoteAddress = {0};
+    socklen_t MappedRemoteAddressLength = 0;
+    BOOLEAN UseIpv4Socket =
+        SocketContext->Binding->LocalAddress.Ip.sa_family == QUIC_ADDRESS_FAMILY_INET;
     struct cmsghdr *CMsg = NULL;
     struct in_pktinfo *PktInfo = NULL;
     struct in6_pktinfo *PktInfo6 = NULL;
@@ -1948,12 +2059,18 @@ CxPlatSocketSendInternal(
         }
     }
     //
-    // Map V4 address to dual-stack socket format.
+    // sendmsg() expects the destination sockaddr to match the socket's native
+    // family. Dual-mode listeners still service IPv4 traffic on AF_INET6
+    // sockets, while pure IPv4 sockets require AF_INET.
     //
-    CxPlatConvertToMappedV6(RemoteAddress, &MappedRemoteAddress);
-
-    if (MappedRemoteAddress.Ipv6.sin6_family == QUIC_ADDRESS_FAMILY_INET6) {
+    if (UseIpv4Socket) {
+        MappedRemoteAddress = *RemoteAddress;
+        MappedRemoteAddress.Ipv4.sin_family = AF_INET;
+        MappedRemoteAddressLength = sizeof(struct sockaddr_in);
+    } else {
+        CxPlatConvertToMappedV6(RemoteAddress, &MappedRemoteAddress);
         MappedRemoteAddress.Ipv6.sin6_family = AF_INET6;
+        MappedRemoteAddressLength = sizeof(struct sockaddr_in6);
     }
 
     struct msghdr Mhdr = {
@@ -1974,8 +2091,12 @@ CxPlatSocketSendInternal(
 
     if (!SocketContext->Binding->Connected) {
         Mhdr.msg_name = &MappedRemoteAddress;
-        Mhdr.msg_namelen = sizeof(MappedRemoteAddress);
-        Mhdr.msg_controllen += CMSG_SPACE(sizeof(struct in6_pktinfo));
+        Mhdr.msg_namelen = MappedRemoteAddressLength;
+        Mhdr.msg_controllen +=
+            CMSG_SPACE(
+                RemoteAddress->Ip.sa_family == QUIC_ADDRESS_FAMILY_INET
+                    ? sizeof(struct in_pktinfo)
+                    : sizeof(struct in6_pktinfo));
         CMsg = CMSG_NXTHDR(&Mhdr, CMsg);
         CXPLAT_DBG_ASSERT(LocalAddress != NULL);
         CXPLAT_DBG_ASSERT(CMsg != NULL);
