@@ -43,7 +43,7 @@ struct in_pktinfo {
 CXPLAT_STATIC_ASSERT((SIZEOF_STRUCT_MEMBER(QUIC_BUFFER, Length) <= sizeof(size_t)), "(sizeof(QUIC_BUFFER.Length) == sizeof(size_t) must be TRUE.");
 CXPLAT_STATIC_ASSERT((SIZEOF_STRUCT_MEMBER(QUIC_BUFFER, Buffer) == sizeof(void*)), "(sizeof(QUIC_BUFFER.Buffer) == sizeof(void*) must be TRUE.");
 
-#if !TARGET_OS_IPHONE
+#if DARWIN_USE_PRIVATE_MSGX_API
 //
 // Darwin private batch I/O syscalls.
 // These are not declared in public SDK headers but the syscall numbers
@@ -60,10 +60,10 @@ ssize_t sendmsg_x(int s, struct msghdr_x *msgp, unsigned int cnt, int flags);
 
 #define CXPLAT_MAX_BATCH_SEND 16
 #define CXPLAT_MAX_BATCH_RECV 16
-#else // TARGET_OS_IPHONE
+#else // DARWIN_USE_PRIVATE_MSGX_API
 #define CXPLAT_MAX_BATCH_SEND 1
 #define CXPLAT_MAX_BATCH_RECV 1
-#endif // !TARGET_OS_IPHONE
+#endif // DARWIN_USE_PRIVATE_MSGX_API
 
 //
 // The maximum single buffer size for sending coalesced payloads.
@@ -388,13 +388,13 @@ typedef struct CXPLAT_DATAPATH {
     //
     uint32_t PartitionCount;
 
-#if !TARGET_OS_IPHONE
+#if DARWIN_USE_PRIVATE_MSGX_API
     //
     // Whether batch I/O syscalls (recvmsg_x/sendmsg_x) are available.
     // Set to TRUE on init; cleared on ENOSYS.
     //
     BOOLEAN HasBatchIo;
-#endif // !TARGET_OS_IPHONE
+#endif // DARWIN_USE_PRIVATE_MSGX_API
 
 #if DEBUG
     uint8_t Uninitialized : 1;
@@ -569,9 +569,9 @@ CxPlatDataPathInitialize(
     }
     Datapath->WorkerPool = WorkerPool;
     Datapath->PartitionCount = CxPlatWorkerPoolGetCount(WorkerPool);
-#if !TARGET_OS_IPHONE
+#if DARWIN_USE_PRIVATE_MSGX_API
     Datapath->HasBatchIo = TRUE;
-#endif // !TARGET_OS_IPHONE
+#endif // DARWIN_USE_PRIVATE_MSGX_API
     CxPlatRefInitializeEx(&Datapath->RefCount, Datapath->PartitionCount);
     CxPlatDataPathCalculateFeatureSupport(Datapath);
 
@@ -1493,7 +1493,7 @@ CxPlatSocketContextIoEventComplete(
     if (Cqe->filter == EVFILT_READ) {
         CXPLAT_DATAPATH* Datapath = SocketContext->Binding->Datapath;
 
-#if !TARGET_OS_IPHONE
+#if DARWIN_USE_PRIVATE_MSGX_API
         if (Datapath->HasBatchIo) {
             //
             // Batch receive path using recvmsg_x.
@@ -1617,7 +1617,7 @@ RecvDone:
 
         } else {
 RecvFallback:
-#endif // !TARGET_OS_IPHONE
+#endif // DARWIN_USE_PRIVATE_MSGX_API
             //
             // Read up to 4 receives with individual recvmsg calls.
             //
@@ -1662,9 +1662,9 @@ RecvFallback:
                     Ret);
                 CxPlatSocketContextReprepareReceive(SocketContext);
             }
-#if !TARGET_OS_IPHONE
+#if DARWIN_USE_PRIVATE_MSGX_API
         }
-#endif // !TARGET_OS_IPHONE
+#endif // DARWIN_USE_PRIVATE_MSGX_API
     }
 
     if (Cqe->filter == EVFILT_WRITE) {
@@ -2275,7 +2275,7 @@ CxPlatSocketSendInternal(
         MappedRemoteAddressLength = sizeof(struct sockaddr_in6);
     }
 
-#if !TARGET_OS_IPHONE
+#if DARWIN_USE_PRIVATE_MSGX_API
     //
     // Try sendmsg_x for connected sockets with multiple buffers.
     // sendmsg_x requires msg_name=NULL and msg_control=NULL, so TOS must
@@ -2343,11 +2343,11 @@ CxPlatSocketSendInternal(
         Status = QUIC_STATUS_SUCCESS;
         goto Exit;
     }
-#endif // !TARGET_OS_IPHONE
+#endif // DARWIN_USE_PRIVATE_MSGX_API
 
-#if !TARGET_OS_IPHONE
+#if DARWIN_USE_PRIVATE_MSGX_API
 SendFallback:
-#endif // !TARGET_OS_IPHONE
+#endif // DARWIN_USE_PRIVATE_MSGX_API
 
     //
     // Send each buffer as a separate datagram via sendmsg.
