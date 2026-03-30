@@ -920,25 +920,27 @@ CxPlatSocketContextInitialize(
     //
     // The socket is shared by multiple QUIC endpoints, so increase the receive
     // buffer size.
+    // Darwin clamps oversized requests to the kernel maximum, so request the
+    // largest practical value here for parity with other datapaths.
     //
-    // Option = INT32_MAX;
-    // Result =
-    //     setsockopt(
-    //         SocketContext->SocketFd,
-    //         SOL_SOCKET,
-    //         SO_RCVBUF,
-    //         (const void*)&Option,
-    //         sizeof(Option));
-    // if (Result == SOCKET_ERROR) {
-    //     Status = errno;
-    //     QuicTracgdfgfdeEvent(
-    //         DatapathErrorStatus,
-    //         "[data][%p] ERROR, %u, %s.",
-    //         Binding,
-    //         Status,
-    //         "setsockopt(SO_RCVBUF) failed");
-    //     goto Exit;
-    // }
+    Option = INT32_MAX;
+    Result =
+        setsockopt(
+            SocketContext->SocketFd,
+            SOL_SOCKET,
+            SO_RCVBUF,
+            (const void*)&Option,
+            sizeof(Option));
+    if (Result == SOCKET_ERROR) {
+        Status = errno;
+        QuicTraceEvent(
+            DatapathErrorStatus,
+            "[data][%p] ERROR, %u, %s.",
+            Binding,
+            Status,
+            "setsockopt(SO_RCVBUF) failed");
+        goto Exit;
+    }
 
     //
     // Only set SO_REUSEPORT on a server socket, otherwise the client could be
