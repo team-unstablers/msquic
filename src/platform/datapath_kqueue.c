@@ -391,9 +391,10 @@ typedef struct CXPLAT_DATAPATH {
 #if DARWIN_USE_PRIVATE_MSGX_API
     //
     // Whether batch I/O syscalls (recvmsg_x/sendmsg_x) are available.
-    // Set to TRUE on init; cleared on ENOSYS.
+    // Set to TRUE on init; cleared on ENOSYS. Accessed atomically because
+    // multiple datapath worker threads can race while discovering ENOSYS.
     //
-    BOOLEAN HasBatchIo;
+    long volatile HasBatchIo;
 #endif // DARWIN_USE_PRIVATE_MSGX_API
 
 #if DEBUG
@@ -1494,7 +1495,7 @@ CxPlatSocketContextIoEventComplete(
         CXPLAT_DATAPATH* Datapath = SocketContext->Binding->Datapath;
 
 #if DARWIN_USE_PRIVATE_MSGX_API
-        if (Datapath->HasBatchIo) {
+        if (InterlockedOr(&Datapath->HasBatchIo, 0)) {
             //
             // Batch receive path using recvmsg_x.
             //
@@ -1564,7 +1565,7 @@ CxPlatSocketContextIoEventComplete(
                     // recvmsg_x is not available on this kernel. Fall back to
                     // recvmsg for this and all future calls.
                     //
-                    Datapath->HasBatchIo = FALSE;
+                    InterlockedAnd(&Datapath->HasBatchIo, 0);
                     goto RecvFallback;
                 }
 
@@ -2282,7 +2283,7 @@ CxPlatSocketSendInternal(
     // be set via setsockopt beforehand.
     //
     if (SocketContext->Binding->Connected &&
-        SocketContext->Binding->Datapath->HasBatchIo &&
+        InterlockedOr(&SocketContext->Binding->Datapath->HasBatchIo, 0) &&
         SendData->BufferCount - SendData->CurrentIndex > 1) {
 
         int Tos = SendData->ECN | (SendData->DSCP << 2);
@@ -2310,7 +2311,7 @@ CxPlatSocketSendInternal(
 
         if (SentCount < 0) {
             if (errno == ENOSYS) {
-                SocketContext->Binding->Datapath->HasBatchIo = FALSE;
+                InterlockedAnd(&SocketContext->Binding->Datapath->HasBatchIo, 0);
                 goto SendFallback;
             }
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
