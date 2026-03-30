@@ -10,7 +10,7 @@
 - ~~특히 `feature` 플래그 정합성, TTL/Hop Limit 수신, 소켓 옵션 보강, receive buffer 설정은 저위험 대비 효과가 크다.~~ feature 플래그 정합성 복구 (`SEND_DSCP`, `RECV_DSCP`, `LOCAL_PORT_SHARING`), `SO_REUSEPORT`, 배치 I/O (`sendmsg_x`/`recvmsg_x`), 다중 파티션이 구현되었다.
 - ~~반면 TCP parity, 다중 파티션 확장, macOS 전용 배치 I/O 도입은 별도 규모의 작업으로 봐야 한다.~~ 다중 파티션과 배치 I/O는 해소됐고, TCP parity만 별도 프로젝트로 남아 있다.
 - ~~`datapath_kqueue.c` 하나만 고쳐서는 해결되지 않는 제약도 있다. Darwin 공용 계층인 `src/platform/platform_posix.c`가 현재 macOS를 사실상 single-core 플랫폼으로 취급한다.~~ `platform_posix.c`의 single-core 제약은 `pthread_cpu_number_np()` 도입으로 해소했다.
-- 남은 저비용 과제: TTL feature advertising end-to-end 완성, `SO_RCVBUF` 복구.
+- 남은 저비용 과제: TTL feature advertising end-to-end 완성.
 
 ## 조사 범위
 
@@ -134,17 +134,26 @@ macOS도 SDK 차원에서 필요한 옵션이 있다.
 
 즉, 이 부분은 OS 한계보다는 구현 공백에 가깝다.
 
-### 3. receive buffer 설정
+### 3. receive buffer 설정 — 완료
 
 Linux는 `SO_RCVBUF`를 크게 키운다.
 
 - `src/platform/datapath_epoll.c:899`
 
-macOS는 동일 로직이 통째로 주석 처리되어 있다.
+macOS도 동일한 의도를 `kqueue` 경로에 복원했다.
 
-- `src/platform/datapath_kqueue.c:793`
+- `src/platform/datapath_kqueue.c:920`
 
-고부하 수신 성능과 drop 회피 관점에서 바로 개선 가능한 항목이다.
+구현 내용:
+
+- `CxPlatSocketContextInitialize()`에서 `SO_RCVBUF`에 `INT32_MAX`를 요청한다.
+- 실패 시 `DatapathErrorStatus` trace 후 socket init을 중단하도록 `epoll`/WinUser와 동일한 에러 경로를 따른다.
+- Darwin은 oversized request를 커널 최대값으로 clamp하므로 별도 `sysctl` probe 없이 parity 동작을 택했다.
+
+검증 메모:
+
+- `msquicplatformtest`의 기본 UDP 송수신 케이스 (`UdpBind`, `UdpData`, `UdpDataECT0`)를 IPv4/IPv6에서 통과시켰다.
+- 로컬 Darwin UDP socket probe에서 `SO_RCVBUF=INT32_MAX` 요청이 오류 없이 더 큰 수신 버퍼로 반영되고, 커널 상한으로 clamp되는 것을 확인했다.
 
 ### 4. local port sharing / multi-socket fanout — ~~격차~~ 해소됨
 
@@ -277,9 +286,9 @@ Darwin private syscall (`SYS_recvmsg_x=480`, `SYS_sendmsg_x=481`)로 공개 SDK�
 
 상태:
 
-- [ ] 미완료
+- [x] 완료
 
-현재 주석 처리된 `SO_RCVBUF` 설정을 되살리고, macOS에서 허용 가능한 상한으로 조정하면 된다.
+`CxPlatSocketContextInitialize()`에서 `setsockopt(SO_RCVBUF, INT32_MAX)`를 복원했다. Darwin이 oversized request를 커널 최대값으로 clamp하므로 별도 상한 탐색 없이 Linux/Windows와 동일한 요청값을 사용한다. 실패 시에는 기존 datapath 초기화 패턴대로 trace 후 즉시 실패 처리한다.
 
 ### 2단계: 중간 규모 개선
 
@@ -348,7 +357,7 @@ epoll 경로의 패턴을 이식했다. 서버 소켓 또는 `CXPLAT_SOCKET_FLAG
 | feature 플래그 정확하게 설정 | Linux GSO/GRO parity |
 | TTL/HopLimit 수신 파싱 | `SO_ATTACH_REUSEPORT_CBPF` 류 RSS |
 | DSCP 송수신 feature 정합성 복구 | QEO 하드웨어 오프로드 |
-| `SO_RCVBUF` 복구 | Linux와 동일한 커널 fanout 모델 |
+| `SO_RCVBUF` 복구 완료 | Linux와 동일한 커널 fanout 모델 |
 | `SO_REUSEPORT` 기반 제한적 확장 | |
 | `sendmsg()` 반복 기반 batching 개선 | |
 | TCP 지원 추가 | |
@@ -387,7 +396,7 @@ epoll 경로의 패턴을 이식했다. 서버 소켓 또는 `CXPLAT_SOCKET_FLAG
 
 `datapath_kqueue.c`는 ~~당장 폐기할 정도로 빈약한 파일은 아니다. UDP 기반의 기본 기능은 갖췄다. 다만 현재는 "최소 동작 구현"에 더 가깝고,~~ 다중 파티션, 배치 I/O, `SO_REUSEPORT` 등 핵심 인프라가 구현된 상태다. Linux `epoll` 경로와 비교하면 다음 층위의 차이가 남아 있다.
 
-- 저비용 누락: ~~feature flags,~~ TTL feature advertising, `SO_RCVBUF`
+- 저비용 누락: ~~feature flags,~~ TTL feature advertising
 - ~~중간 규모 격차: `SO_REUSEPORT`, batching~~ → 해소됨
 - ~~대규모 미구현: TCP, multi-partition scaling~~ → multi-partition 해소, TCP만 잔존
 - 잔존 대규모 미구현: TCP 포팅
@@ -396,7 +405,7 @@ epoll 경로의 패턴을 이식했다. 서버 소켓 또는 `CXPLAT_SOCKET_FLAG
 
 1. ~~feature advertising 정리~~ → 완료 (`SEND_DSCP`, `RECV_DSCP`, `LOCAL_PORT_SHARING`)
 2. TTL/HopLimit 수신 end-to-end 완성 (feature advertising 포함)
-3. `SO_RCVBUF` 복구
+3. ~~`SO_RCVBUF` 복구~~ → 완료 (`setsockopt(SO_RCVBUF, INT32_MAX)`, Darwin clamp)
 4. ~~`SO_REUSEPORT` 실험적 도입~~ → 완료
 5. ~~batching 개선~~ → 완료 (`sendmsg_x`/`recvmsg_x` + `sendmsg` 반복 폴백)
 6. ~~multi-partition 재설계~~ → 완료 (`pthread_cpu_number_np` + 파티션 카운트 복원)
