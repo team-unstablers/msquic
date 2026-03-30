@@ -1554,9 +1554,7 @@ CxPlatSocketContextIoEventComplete(
                 // Return all allocated recv blocks to the pool.
                 //
                 for (int i = 0; i < PreparedCount; i++) {
-                    CxPlatPoolFree(
-                        &SocketContext->DatapathPartition->RecvBlockPool,
-                        RecvBlocks[i]);
+                    CxPlatPoolFree(RecvBlocks[i]);
                 }
 
                 if (ErrNum == ENOSYS) {
@@ -1603,9 +1601,7 @@ CxPlatSocketContextIoEventComplete(
                 // Return unused recv blocks to the pool.
                 //
                 for (int i = (int)RecvCount; i < PreparedCount; i++) {
-                    CxPlatPoolFree(
-                        &SocketContext->DatapathPartition->RecvBlockPool,
-                        RecvBlocks[i]);
+                    CxPlatPoolFree(RecvBlocks[i]);
                 }
             }
 
