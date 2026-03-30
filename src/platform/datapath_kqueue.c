@@ -25,6 +25,7 @@ struct in_pktinfo {
 #define __APPLE_USE_RFC_3542 1
 // See netinet6/in6.h:46 for an explanation
 #include "platform_internal.h"
+#include <TargetConditionals.h>
 #include <sys/sysctl.h>
 
 #ifdef QUIC_CLOG
@@ -42,10 +43,27 @@ struct in_pktinfo {
 CXPLAT_STATIC_ASSERT((SIZEOF_STRUCT_MEMBER(QUIC_BUFFER, Length) <= sizeof(size_t)), "(sizeof(QUIC_BUFFER.Length) == sizeof(size_t) must be TRUE.");
 CXPLAT_STATIC_ASSERT((SIZEOF_STRUCT_MEMBER(QUIC_BUFFER, Buffer) == sizeof(void*)), "(sizeof(QUIC_BUFFER.Buffer) == sizeof(void*) must be TRUE.");
 
+#if !TARGET_OS_IPHONE
 //
-// TODO: Support batching.
+// Darwin private batch I/O syscalls.
+// These are not declared in public SDK headers but the syscall numbers
+// are exported in <sys/syscall.h> (SYS_sendmsg_x=481, SYS_recvmsg_x=480).
+// Not available on iOS.
 //
+struct msghdr_x {
+    struct msghdr msg_hdr;
+    size_t msg_datalen;
+};
+
+ssize_t recvmsg_x(int s, struct msghdr_x *msgp, unsigned int cnt, int flags);
+ssize_t sendmsg_x(int s, struct msghdr_x *msgp, unsigned int cnt, int flags);
+
+#define CXPLAT_MAX_BATCH_SEND 16
+#define CXPLAT_MAX_BATCH_RECV 16
+#else // TARGET_OS_IPHONE
 #define CXPLAT_MAX_BATCH_SEND 1
+#define CXPLAT_MAX_BATCH_RECV 1
+#endif // !TARGET_OS_IPHONE
 
 //
 // The maximum single buffer size for sending coalesced payloads.
@@ -268,6 +286,11 @@ typedef struct CXPLAT_SOCKET {
     //
     BOOLEAN PcpBinding : 1;
 
+    //
+    // Flag indicates the binding is shared across processors.
+    //
+    BOOLEAN SharedBinding : 1;
+
 #if DEBUG
     uint8_t Uninitialized : 1;
     uint8_t Freed : 1;
@@ -365,6 +388,14 @@ typedef struct CXPLAT_DATAPATH {
     //
     uint32_t PartitionCount;
 
+#if !TARGET_OS_IPHONE
+    //
+    // Whether batch I/O syscalls (recvmsg_x/sendmsg_x) are available.
+    // Set to TRUE on init; cleared on ENOSYS.
+    //
+    BOOLEAN HasBatchIo;
+#endif // !TARGET_OS_IPHONE
+
 #if DEBUG
     uint8_t Uninitialized : 1;
     uint8_t Freed : 1;
@@ -386,7 +417,7 @@ CxPlatDataPathCalculateFeatureSupport(
     _Inout_ CXPLAT_DATAPATH* Datapath
     )
 {
-    Datapath->Features = 0;
+    Datapath->Features = CXPLAT_DATAPATH_FEATURE_LOCAL_PORT_SHARING;
 
 #if defined(IP_TOS) && defined(IPV6_TCLASS)
     Datapath->Features |= CXPLAT_DATAPATH_FEATURE_SEND_DSCP;
@@ -537,7 +568,10 @@ CxPlatDataPathInitialize(
         Datapath->UdpHandlers = *UdpCallbacks;
     }
     Datapath->WorkerPool = WorkerPool;
-    Datapath->PartitionCount = 1; //CxPlatWorkerPoolGetCount(WorkerPool); // Darwin only supports a single receiver
+    Datapath->PartitionCount = CxPlatWorkerPoolGetCount(WorkerPool);
+#if !TARGET_OS_IPHONE
+    Datapath->HasBatchIo = TRUE;
+#endif // !TARGET_OS_IPHONE
     CxPlatRefInitializeEx(&Datapath->RefCount, Datapath->PartitionCount);
     CxPlatDataPathCalculateFeatureSupport(Datapath);
 
@@ -907,6 +941,32 @@ CxPlatSocketContextInitialize(
     // }
 
     //
+    // Only set SO_REUSEPORT on a server socket, otherwise the client could be
+    // assigned a server port (unless it's forcing sharing).
+    //
+    if ((Binding->SharedBinding || !Binding->HasFixedRemoteAddress) &&
+        Binding->Datapath->PartitionCount > 1) {
+        Option = TRUE;
+        Result =
+            setsockopt(
+                SocketContext->SocketFd,
+                SOL_SOCKET,
+                SO_REUSEPORT,
+                (const void*)&Option,
+                sizeof(Option));
+        if (Result == SOCKET_ERROR) {
+            Status = errno;
+            QuicTraceEvent(
+                DatapathErrorStatus,
+                "[data][%p] ERROR, %u, %s.",
+                Binding,
+                Status,
+                "setsockopt(SO_REUSEPORT) failed");
+            goto Exit;
+        }
+    }
+
+    //
     // bind() to local port if we need to. This is not necessary if we call connect
     // afterward and there is no ask for particular source address or port.
     // connect() will resolve that together in single system call.
@@ -1181,14 +1241,12 @@ Error:
 void
 CxPlatSocketContextRecvComplete(
     _In_ CXPLAT_SOCKET_CONTEXT* SocketContext,
+    _In_ struct msghdr* MsgHdr,
+    _In_ DATAPATH_RX_IO_BLOCK* RecvBlock,
     _In_ ssize_t BytesTransferred
     )
 {
-    QUIC_STATUS Status = QUIC_STATUS_SUCCESS; // cppcheck-suppress unreadVariable
-
-    CXPLAT_DBG_ASSERT(SocketContext->CurrentRecvBlock != NULL);
-    CXPLAT_RECV_DATA* RecvPacket = &SocketContext->CurrentRecvBlock->RecvPacket;
-    SocketContext->CurrentRecvBlock = NULL;
+    CXPLAT_RECV_DATA* RecvPacket = &RecvBlock->RecvPacket;
 
     BOOLEAN FoundLocalAddr = FALSE; // cppcheck-suppress unreadVariable
     BOOLEAN FoundTOS = FALSE; // cppcheck-suppress unreadVariable
@@ -1211,9 +1269,9 @@ CxPlatSocketContextRecvComplete(
     RecvPacket->HopLimitTTL = 0;
 
     struct cmsghdr *CMsg;
-    for (CMsg = CMSG_FIRSTHDR(&SocketContext->RecvMsgHdr);
+    for (CMsg = CMSG_FIRSTHDR(MsgHdr);
          CMsg != NULL;
-         CMsg = CMSG_NXTHDR(&SocketContext->RecvMsgHdr, CMsg)) {
+         CMsg = CMSG_NXTHDR(MsgHdr, CMsg)) {
 
         if (CMsg->cmsg_level == IPPROTO_IPV6) {
             if (CMsg->cmsg_type == IPV6_PKTINFO) {
@@ -1308,7 +1366,14 @@ CxPlatSocketContextRecvComplete(
             SocketContext->Binding->ClientContext,
             RecvPacket);
     }
+}
 
+void
+CxPlatSocketContextReprepareReceive(
+    _In_ CXPLAT_SOCKET_CONTEXT* SocketContext
+    )
+{
+    QUIC_STATUS Status = QUIC_STATUS_SUCCESS;
     int32_t RetryCount = 0;
     do {
         Status = CxPlatSocketContextPrepareReceive(SocketContext);
@@ -1424,48 +1489,184 @@ CxPlatSocketContextIoEventComplete(
     CXPLAT_DBG_ASSERT(Cqe->filter & (EVFILT_READ | EVFILT_WRITE | EVFILT_USER));
 
     if (Cqe->filter == EVFILT_READ) {
-        //
-        // Read up to 4 receives before moving to another event.
-        //
-        for (int i = 0; i < 4; i++) {
-            CXPLAT_DBG_ASSERT(SocketContext->CurrentRecvBlock != NULL);
+        CXPLAT_DATAPATH* Datapath = SocketContext->Binding->Datapath;
 
-            ssize_t Ret =
-                recvmsg(
+#if !TARGET_OS_IPHONE
+        if (Datapath->HasBatchIo) {
+            //
+            // Batch receive path using recvmsg_x.
+            //
+            DATAPATH_RX_IO_BLOCK* RecvBlocks[CXPLAT_MAX_BATCH_RECV];
+            struct msghdr_x MsgVec[CXPLAT_MAX_BATCH_RECV];
+            struct iovec Iovs[CXPLAT_MAX_BATCH_RECV];
+            char ControlBufs[CXPLAT_MAX_BATCH_RECV]
+                            [CMSG_SPACE(sizeof(struct in6_pktinfo)) +
+                             CMSG_SPACE(sizeof(struct in_pktinfo)) +
+                             2 * CMSG_SPACE(sizeof(int))];
+
+            int PreparedCount = 0;
+            for (int i = 0; i < CXPLAT_MAX_BATCH_RECV; i++) {
+                RecvBlocks[i] =
+                    CxPlatDataPathAllocRxIoBlock(SocketContext->DatapathPartition);
+                if (RecvBlocks[i] == NULL) {
+                    break;
+                }
+                RecvBlocks[i]->RecvPacket.Next = NULL;
+                RecvBlocks[i]->RecvPacket.BufferLength =
+                    SocketContext->Binding->Mtu -
+                    CXPLAT_MIN_IPV4_HEADER_SIZE -
+                    CXPLAT_UDP_HEADER_SIZE;
+                RecvBlocks[i]->RecvPacket.Route = &RecvBlocks[i]->Route;
+
+                Iovs[i].iov_base = RecvBlocks[i]->RecvPacket.Buffer;
+                Iovs[i].iov_len = RecvBlocks[i]->RecvPacket.BufferLength;
+
+                CxPlatZeroMemory(&MsgVec[i], sizeof(MsgVec[i]));
+                CxPlatZeroMemory(&ControlBufs[i], sizeof(ControlBufs[i]));
+                MsgVec[i].msg_hdr.msg_name =
+                    &RecvBlocks[i]->RecvPacket.Route->RemoteAddress;
+                MsgVec[i].msg_hdr.msg_namelen =
+                    sizeof(RecvBlocks[i]->RecvPacket.Route->RemoteAddress);
+                MsgVec[i].msg_hdr.msg_iov = &Iovs[i];
+                MsgVec[i].msg_hdr.msg_iovlen = 1;
+                MsgVec[i].msg_hdr.msg_control = ControlBufs[i];
+                MsgVec[i].msg_hdr.msg_controllen = sizeof(ControlBufs[i]);
+                MsgVec[i].msg_datalen = 0;
+
+                PreparedCount++;
+            }
+
+            if (PreparedCount == 0) {
+                goto RecvDone;
+            }
+
+            ssize_t RecvCount =
+                recvmsg_x(
                     SocketContext->SocketFd,
-                    &SocketContext->RecvMsgHdr,
-                    0);
-            if (Ret < 0) {
+                    MsgVec,
+                    (unsigned int)PreparedCount,
+                    MSG_DONTWAIT);
+
+            if (RecvCount < 0) {
                 int ErrNum = errno;
+
+                //
+                // Return all allocated recv blocks to the pool.
+                //
+                for (int i = 0; i < PreparedCount; i++) {
+                    CxPlatPoolFree(
+                        &SocketContext->DatapathPartition->RecvBlockPool,
+                        RecvBlocks[i]);
+                }
+
+                if (ErrNum == ENOSYS) {
+                    //
+                    // recvmsg_x is not available on this kernel. Fall back to
+                    // recvmsg for this and all future calls.
+                    //
+                    Datapath->HasBatchIo = FALSE;
+                    goto RecvFallback;
+                }
+
                 if (ErrNum != EAGAIN && ErrNum != EWOULDBLOCK) {
                     QuicTraceEvent(
                         DatapathErrorStatus,
                         "[data][%p] ERROR, %u, %s.",
                         SocketContext->Binding,
-                        errno,
-                        "recvmsg failed");
+                        ErrNum,
+                        "recvmsg_x failed");
 
-                    //
-                    // The read can also return unreachable events. There is no
-                    // flag to detect this state other then to call recvmsg.
-                    // Send unreachable notification to MsQuic if any related
-                    // errors were received.
-                    //
                     if (ErrNum == ECONNREFUSED ||
                         ErrNum == EHOSTUNREACH ||
                         ErrNum == ENETUNREACH) {
                         if (!SocketContext->Binding->PcpBinding) {
-                            SocketContext->Binding->Datapath->UdpHandlers.Unreachable(
+                            Datapath->UdpHandlers.Unreachable(
                                 SocketContext->Binding,
                                 SocketContext->Binding->ClientContext,
                                 &SocketContext->Binding->RemoteAddress);
                         }
                     }
                 }
-                break;
+            } else {
+                //
+                // Process received messages.
+                //
+                for (ssize_t i = 0; i < RecvCount; i++) {
+                    CxPlatSocketContextRecvComplete(
+                        SocketContext,
+                        &MsgVec[i].msg_hdr,
+                        RecvBlocks[i],
+                        (ssize_t)MsgVec[i].msg_datalen);
+                }
+
+                //
+                // Return unused recv blocks to the pool.
+                //
+                for (int i = (int)RecvCount; i < PreparedCount; i++) {
+                    CxPlatPoolFree(
+                        &SocketContext->DatapathPartition->RecvBlockPool,
+                        RecvBlocks[i]);
+                }
             }
-            CxPlatSocketContextRecvComplete(SocketContext, Ret);
+
+RecvDone:
+            //
+            // Re-prepare the socket context for the next single recvmsg
+            // (used by the fallback path and needed to keep CurrentRecvBlock
+            // in a valid state).
+            //
+            CxPlatSocketContextReprepareReceive(SocketContext);
+
+        } else {
+RecvFallback:
+#endif // !TARGET_OS_IPHONE
+            //
+            // Read up to 4 receives with individual recvmsg calls.
+            //
+            for (int i = 0; i < 4; i++) {
+                CXPLAT_DBG_ASSERT(SocketContext->CurrentRecvBlock != NULL);
+
+                ssize_t Ret =
+                    recvmsg(
+                        SocketContext->SocketFd,
+                        &SocketContext->RecvMsgHdr,
+                        0);
+                if (Ret < 0) {
+                    int ErrNum = errno;
+                    if (ErrNum != EAGAIN && ErrNum != EWOULDBLOCK) {
+                        QuicTraceEvent(
+                            DatapathErrorStatus,
+                            "[data][%p] ERROR, %u, %s.",
+                            SocketContext->Binding,
+                            errno,
+                            "recvmsg failed");
+
+                        if (ErrNum == ECONNREFUSED ||
+                            ErrNum == EHOSTUNREACH ||
+                            ErrNum == ENETUNREACH) {
+                            if (!SocketContext->Binding->PcpBinding) {
+                                Datapath->UdpHandlers.Unreachable(
+                                    SocketContext->Binding,
+                                    SocketContext->Binding->ClientContext,
+                                    &SocketContext->Binding->RemoteAddress);
+                            }
+                        }
+                    }
+                    break;
+                }
+                DATAPATH_RX_IO_BLOCK* RecvBlock =
+                    SocketContext->CurrentRecvBlock;
+                SocketContext->CurrentRecvBlock = NULL;
+                CxPlatSocketContextRecvComplete(
+                    SocketContext,
+                    &SocketContext->RecvMsgHdr,
+                    RecvBlock,
+                    Ret);
+                CxPlatSocketContextReprepareReceive(SocketContext);
+            }
+#if !TARGET_OS_IPHONE
         }
+#endif // !TARGET_OS_IPHONE
     }
 
     if (Cqe->filter == EVFILT_WRITE) {
@@ -1544,6 +1745,9 @@ CxPlatSocketCreateUdp(
 
     if (Config->Flags & CXPLAT_SOCKET_FLAG_PCP) {
         Binding->PcpBinding = TRUE;
+    }
+    if (Config->Flags & CXPLAT_SOCKET_FLAG_SHARE) {
+        Binding->SharedBinding = TRUE;
     }
 
     for (uint32_t i = 0; i < SocketCount; i++) {
@@ -2073,90 +2277,143 @@ CxPlatSocketSendInternal(
         MappedRemoteAddressLength = sizeof(struct sockaddr_in6);
     }
 
-    struct msghdr Mhdr = {
-        .msg_name = NULL,
-        .msg_namelen = 0,
-        .msg_iov = SendData->Iovs,
-        .msg_iovlen = SendData->BufferCount,
-        .msg_control = ControlBuffer,
-        .msg_controllen = CMSG_SPACE(sizeof(int)),
-        .msg_flags = 0
-    };
+#if !TARGET_OS_IPHONE
+    //
+    // Try sendmsg_x for connected sockets with multiple buffers.
+    // sendmsg_x requires msg_name=NULL and msg_control=NULL, so TOS must
+    // be set via setsockopt beforehand.
+    //
+    if (SocketContext->Binding->Connected &&
+        SocketContext->Binding->Datapath->HasBatchIo &&
+        SendData->BufferCount - SendData->CurrentIndex > 1) {
 
-    CMsg = CMSG_FIRSTHDR(&Mhdr);
-    CMsg->cmsg_level = RemoteAddress->Ip.sa_family == QUIC_ADDRESS_FAMILY_INET ? IPPROTO_IP : IPPROTO_IPV6;
-    CMsg->cmsg_type = RemoteAddress->Ip.sa_family == QUIC_ADDRESS_FAMILY_INET ? IP_TOS : IPV6_TCLASS;
-    CMsg->cmsg_len = CMSG_LEN(sizeof(int));
-    *(int *)CMSG_DATA(CMsg) = SendData->ECN | (SendData->DSCP << 2);
+        int Tos = SendData->ECN | (SendData->DSCP << 2);
+        setsockopt(
+            SocketContext->SocketFd,
+            UseIpv4Socket ? IPPROTO_IP : IPPROTO_IPV6,
+            UseIpv4Socket ? IP_TOS : IPV6_TCLASS,
+            &Tos, sizeof(Tos));
 
-    if (!SocketContext->Binding->Connected) {
-        Mhdr.msg_name = &MappedRemoteAddress;
-        Mhdr.msg_namelen = MappedRemoteAddressLength;
-        Mhdr.msg_controllen +=
-            CMSG_SPACE(
-                RemoteAddress->Ip.sa_family == QUIC_ADDRESS_FAMILY_INET
-                    ? sizeof(struct in_pktinfo)
-                    : sizeof(struct in6_pktinfo));
-        CMsg = CMSG_NXTHDR(&Mhdr, CMsg);
-        CXPLAT_DBG_ASSERT(LocalAddress != NULL);
-        CXPLAT_DBG_ASSERT(CMsg != NULL);
-        if (RemoteAddress->Ip.sa_family == QUIC_ADDRESS_FAMILY_INET) {
-            CMsg->cmsg_level = IPPROTO_IP;
+        uint32_t Remaining = SendData->BufferCount - SendData->CurrentIndex;
+        struct msghdr_x MsgVec[CXPLAT_MAX_BATCH_SEND];
+        CxPlatZeroMemory(MsgVec, Remaining * sizeof(MsgVec[0]));
+        for (uint32_t i = 0; i < Remaining; ++i) {
+            uint32_t Idx = SendData->CurrentIndex + i;
+            MsgVec[i].msg_hdr.msg_iov = &SendData->Iovs[Idx];
+            MsgVec[i].msg_hdr.msg_iovlen = 1;
+        }
+
+        ssize_t SentCount =
+            sendmsg_x(
+                SocketContext->SocketFd,
+                MsgVec,
+                (unsigned int)Remaining,
+                MSG_DONTWAIT);
+
+        if (SentCount < 0) {
+            if (errno == ENOSYS) {
+                SocketContext->Binding->Datapath->HasBatchIo = FALSE;
+                goto SendFallback;
+            }
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                goto SendWouldBlock;
+            }
+            Status = errno;
+            QuicTraceEvent(
+                DatapathErrorStatus,
+                "[data][%p] ERROR, %u, %s.",
+                SocketContext->Binding,
+                Status,
+                "sendmsg_x failed");
+            if (Status == ECONNREFUSED ||
+                Status == EHOSTUNREACH ||
+                Status == ENETUNREACH) {
+                if (!SocketContext->Binding->PcpBinding) {
+                    SocketContext->Binding->Datapath->UdpHandlers.Unreachable(
+                        SocketContext->Binding,
+                        SocketContext->Binding->ClientContext,
+                        &SocketContext->Binding->RemoteAddress);
+                }
+            }
+            goto Exit;
+        }
+
+        SendData->CurrentIndex += (uint32_t)SentCount;
+        if (SendData->CurrentIndex < SendData->BufferCount) {
+            goto SendWouldBlock;
+        }
+        Status = QUIC_STATUS_SUCCESS;
+        goto Exit;
+    }
+#endif // !TARGET_OS_IPHONE
+
+#if !TARGET_OS_IPHONE
+SendFallback:
+#endif // !TARGET_OS_IPHONE
+
+    //
+    // Send each buffer as a separate datagram via sendmsg.
+    //
+    while (SendData->CurrentIndex < SendData->BufferCount) {
+        struct msghdr Mhdr = {
+            .msg_name = NULL,
+            .msg_namelen = 0,
+            .msg_iov = &SendData->Iovs[SendData->CurrentIndex],
+            .msg_iovlen = 1,
+            .msg_control = ControlBuffer,
+            .msg_controllen = CMSG_SPACE(sizeof(int)),
+            .msg_flags = 0
+        };
+
+        CMsg = CMSG_FIRSTHDR(&Mhdr);
+        CMsg->cmsg_level = RemoteAddress->Ip.sa_family == QUIC_ADDRESS_FAMILY_INET ? IPPROTO_IP : IPPROTO_IPV6;
+        CMsg->cmsg_type = RemoteAddress->Ip.sa_family == QUIC_ADDRESS_FAMILY_INET ? IP_TOS : IPV6_TCLASS;
+        CMsg->cmsg_len = CMSG_LEN(sizeof(int));
+        *(int *)CMSG_DATA(CMsg) = SendData->ECN | (SendData->DSCP << 2);
+
+        if (!SocketContext->Binding->Connected) {
+            Mhdr.msg_name = &MappedRemoteAddress;
+            Mhdr.msg_namelen = MappedRemoteAddressLength;
+            Mhdr.msg_controllen +=
+                CMSG_SPACE(
+                    RemoteAddress->Ip.sa_family == QUIC_ADDRESS_FAMILY_INET
+                        ? sizeof(struct in_pktinfo)
+                        : sizeof(struct in6_pktinfo));
+            CMsg = CMSG_NXTHDR(&Mhdr, CMsg);
+            CXPLAT_DBG_ASSERT(LocalAddress != NULL);
+            CXPLAT_DBG_ASSERT(CMsg != NULL);
+            if (RemoteAddress->Ip.sa_family == QUIC_ADDRESS_FAMILY_INET) {
+                CMsg->cmsg_level = IPPROTO_IP;
 #if defined(IP_PKTINFO)
-            CMsg->cmsg_type = IP_PKTINFO;
-            CMsg->cmsg_len = CMSG_LEN(sizeof(struct in_pktinfo));
+                CMsg->cmsg_type = IP_PKTINFO;
+                CMsg->cmsg_len = CMSG_LEN(sizeof(struct in_pktinfo));
 #elif defined(IP_RECVDSTADDR)
-            CMsg->cmsg_type = IP_RECVDSTADDR;
-            CMsg->cmsg_len = CMSG_LEN(sizeof(struct in_addr));
+                CMsg->cmsg_type = IP_RECVDSTADDR;
+                CMsg->cmsg_len = CMSG_LEN(sizeof(struct in_addr));
 #else
 #error "No socket option specified"
 #endif
-            PktInfo = (struct in_pktinfo*) CMSG_DATA(CMsg);
-            // TODO: Use Ipv4 instead of Ipv6.
-            PktInfo->ipi_ifindex = LocalAddress->Ipv6.sin6_scope_id;
-            PktInfo->ipi_spec_dst = LocalAddress->Ipv4.sin_addr;
-            PktInfo->ipi_addr = LocalAddress->Ipv4.sin_addr;
-        } else {
-            CMsg->cmsg_level = IPPROTO_IPV6;
-            CMsg->cmsg_type = IPV6_PKTINFO;
-            CMsg->cmsg_len = CMSG_LEN(sizeof(struct in6_pktinfo));
-            PktInfo6 = (struct in6_pktinfo*) CMSG_DATA(CMsg);
-            PktInfo6->ipi6_ifindex = LocalAddress->Ipv6.sin6_scope_id;
-            PktInfo6->ipi6_addr = LocalAddress->Ipv6.sin6_addr;
+                PktInfo = (struct in_pktinfo*) CMSG_DATA(CMsg);
+                // TODO: Use Ipv4 instead of Ipv6.
+                PktInfo->ipi_ifindex = LocalAddress->Ipv6.sin6_scope_id;
+                PktInfo->ipi_spec_dst = LocalAddress->Ipv4.sin_addr;
+                PktInfo->ipi_addr = LocalAddress->Ipv4.sin_addr;
+            } else {
+                CMsg->cmsg_level = IPPROTO_IPV6;
+                CMsg->cmsg_type = IPV6_PKTINFO;
+                CMsg->cmsg_len = CMSG_LEN(sizeof(struct in6_pktinfo));
+                PktInfo6 = (struct in6_pktinfo*) CMSG_DATA(CMsg);
+                PktInfo6->ipi6_ifindex = LocalAddress->Ipv6.sin6_scope_id;
+                PktInfo6->ipi6_addr = LocalAddress->Ipv6.sin6_addr;
+            }
         }
-    }
 
-    SentByteCount = sendmsg(SocketContext->SocketFd, &Mhdr, 0);
+        SentByteCount = sendmsg(SocketContext->SocketFd, &Mhdr, 0);
 
-    if (SentByteCount < 0) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            if (!IsPendedSend) {
-                CxPlatLockAcquire(&SocketContext->PendingSendDataLock);
-                CxPlatSocketContextPendSend(
-                    SocketContext,
-                    SendData,
-                    LocalAddress,
-                    RemoteAddress);
-                CxPlatLockRelease(&SocketContext->PendingSendDataLock);
+        if (SentByteCount < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                goto SendWouldBlock;
             }
-            SendPending = TRUE;
-            if (!CxPlatEventQEnqueueEx(
-                    SocketContext->DatapathPartition->EventQ,
-                    &SocketContext->IoSqe,
-                    EVFILT_WRITE,
-                    EV_ADD | EV_ONESHOT | EV_CLEAR)) {
-                Status = errno;
-                QuicTraceEvent(
-                    DatapathErrorStatus,
-                    "[data][%p] ERROR, %u, %s.",
-                    SocketContext->Binding,
-                    Status,
-                    "CxPlatEventQEnqueueEx failed");
-                goto Exit;
-            }
-            Status = QUIC_STATUS_PENDING;
-            goto Exit;
-        } else {
             Status = errno;
             QuicTraceEvent(
                 DatapathErrorStatus,
@@ -2182,9 +2439,39 @@ CxPlatSocketSendInternal(
             }
             goto Exit;
         }
+        SendData->CurrentIndex++;
     }
 
     Status = QUIC_STATUS_SUCCESS;
+    goto Exit;
+
+SendWouldBlock:
+
+    if (!IsPendedSend) {
+        CxPlatLockAcquire(&SocketContext->PendingSendDataLock);
+        CxPlatSocketContextPendSend(
+            SocketContext,
+            SendData,
+            LocalAddress,
+            RemoteAddress);
+        CxPlatLockRelease(&SocketContext->PendingSendDataLock);
+    }
+    SendPending = TRUE;
+    if (!CxPlatEventQEnqueueEx(
+            SocketContext->DatapathPartition->EventQ,
+            &SocketContext->IoSqe,
+            EVFILT_WRITE,
+            EV_ADD | EV_ONESHOT | EV_CLEAR)) {
+        Status = errno;
+        QuicTraceEvent(
+            DatapathErrorStatus,
+            "[data][%p] ERROR, %u, %s.",
+            SocketContext->Binding,
+            Status,
+            "CxPlatEventQEnqueueEx failed");
+        goto Exit;
+    }
+    Status = QUIC_STATUS_PENDING;
 
 Exit:
 
