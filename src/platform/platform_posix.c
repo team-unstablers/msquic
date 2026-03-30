@@ -98,15 +98,7 @@ CxPlatSystemLoad(
     void
     )
 {
-#if defined(CX_PLATFORM_DARWIN)
-    //
-    // arm64 macOS has no way to get the current proc, so treat as single core.
-    // Intel macOS can return incorrect values for CPUID, so treat as single core.
-    //
-    CxPlatProcessorCount = 1;
-#else
     CxPlatProcessorCount = (uint32_t)sysconf(_SC_NPROCESSORS_ONLN);
-#endif
 
 #ifdef CXPLAT_NUMA_AWARE
     if (numa_available() >= 0) {
@@ -525,10 +517,10 @@ CxPlatProcCurrentNumber(
 #if defined(CX_PLATFORM_LINUX)
     return (uint32_t)sched_getcpu() % CxPlatProcessorCount;
 #elif defined(CX_PLATFORM_DARWIN)
-    //
-    // arm64 macOS has no way to get the current proc, so treat as single core.
-    // Intel macOS can return incorrect values for CPUID, so treat as single core.
-    //
+    size_t CpuNumber;
+    if (pthread_cpu_number_np(&CpuNumber) == 0) {
+        return (uint32_t)(CpuNumber % CxPlatProcessorCount);
+    }
     return 0;
 #endif // CX_PLATFORM_DARWIN
 }
