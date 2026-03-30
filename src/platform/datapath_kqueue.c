@@ -2304,6 +2304,8 @@ CxPlatSocketSendInternal(
         }
 
         uint32_t Remaining = SendData->BufferCount - SendData->CurrentIndex;
+        CXPLAT_DBG_ASSERT(Remaining <= CXPLAT_MAX_BATCH_SEND);
+        Remaining = CXPLAT_MIN(Remaining, CXPLAT_MAX_BATCH_SEND);
         struct msghdr_x MsgVec[CXPLAT_MAX_BATCH_SEND];
         CxPlatZeroMemory(MsgVec, Remaining * sizeof(MsgVec[0]));
         for (uint32_t i = 0; i < Remaining; ++i) {
