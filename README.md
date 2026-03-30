@@ -15,6 +15,36 @@ protocol. It is cross-platform, written in C and designed to be a general purpos
 > You are using MsQuic? Let us know! Knowing our users lets us prioritize work and keep improving MsQuic in the best possible direction.
 > Post in the [Discussion](https://github.com/microsoft/msquic/discussions/4963) to say hello and give us a wave on [Discord](https://discord.gg/YGAtCwTSsc)!
 
+## About This Fork
+
+This is the **tuvariant** fork of MsQuic, maintained at [`team-unstablers/msquic`](https://github.com/team-unstablers/msquic). It is based on upstream v2.5.6 with the following changes:
+
+### macOS kqueue datapath overhaul
+
+The upstream kqueue datapath was minimal and lacked key features available on Linux (epoll) and Windows (IOCP). This fork brings it closer to parity:
+
+- **Multi-partition datapath with batch I/O** — enables parallel packet processing across multiple cores, matching the multi-queue design of the epoll datapath.
+- **Multi-core processor detection on Darwin** — the POSIX platform layer now correctly reports processor count on macOS, enabling proper partition scaling.
+- **Receive buffer scaling** — restores `SO_RCVBUF` socket option support for kqueue sockets.
+- **Feature support calculation and IPv4 socket handling fixes** — correct datapath feature flags and dual-stack socket behavior on macOS.
+- **`sendmsg_x`/`recvmsg_x` gated behind `DARWIN_USE_PRIVATE_MSGX_API`** — these Darwin-private batch send/receive APIs are available as an opt-in build flag.
+
+### In-memory PEM certificate support (QuicTLS)
+
+- **`QUIC_CERTIFICATE_PEM` credential type** — load TLS certificates and private keys directly from in-memory PEM buffers, without requiring files on disk.
+- **Chained certificate support** — PEM buffers may contain a full certificate chain (leaf + intermediates).
+- **Password-protected private key support** — PEM private keys encrypted with a passphrase are now handled correctly.
+- **Bug fixes** — off-by-one in password buffer overflow check, ignored errors in PEM chain loading, improved SAL annotations and assertions.
+
+### Other changes
+
+- Removed unnecessary `dlopen()` call on POSIX platforms.
+
+> [!CAUTION]
+> **Apple App Store submission:** The `DARWIN_USE_PRIVATE_MSGX_API` CMake option enables `sendmsg_x`/`recvmsg_x`, which are **private Darwin APIs not part of the public SDK**. Builds with this option enabled will likely be **rejected during App Store review**. Make sure this option is OFF (the default) when building for any Apple platform target submitted to the App Store.
+
+---
+
 ## Protocol Features
 
 [![](https://img.shields.io/static/v1?label=RFC&message=9000&color=brightgreen)](https://tools.ietf.org/html/rfc9000)
