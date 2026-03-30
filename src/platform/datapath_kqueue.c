@@ -1495,7 +1495,10 @@ CxPlatSocketContextIoEventComplete(
         CXPLAT_DATAPATH* Datapath = SocketContext->Binding->Datapath;
 
 #if DARWIN_USE_PRIVATE_MSGX_API
+        BOOLEAN UseRecvFallback = TRUE;
         if (InterlockedOr(&Datapath->HasBatchIo, 0)) {
+            UseRecvFallback = FALSE;
+
             //
             // Batch receive path using recvmsg_x.
             //
@@ -1540,84 +1543,97 @@ CxPlatSocketContextIoEventComplete(
             }
 
             if (PreparedCount == 0) {
-                goto RecvDone;
-            }
-
-            ssize_t RecvCount =
-                recvmsg_x(
-                    SocketContext->SocketFd,
-                    MsgVec,
-                    (unsigned int)PreparedCount,
-                    MSG_DONTWAIT);
-
-            if (RecvCount < 0) {
-                int ErrNum = errno;
-
                 //
-                // Return all allocated recv blocks to the pool.
+                // Re-prepare the socket context for the next single recvmsg
+                // (used by the fallback path and needed to keep CurrentRecvBlock
+                // in a valid state).
                 //
-                for (int i = 0; i < PreparedCount; i++) {
-                    CxPlatPoolFree(RecvBlocks[i]);
-                }
+                CxPlatSocketContextReprepareReceive(SocketContext);
 
-                if (ErrNum == ENOSYS) {
-                    //
-                    // recvmsg_x is not available on this kernel. Fall back to
-                    // recvmsg for this and all future calls.
-                    //
-                    InterlockedAnd(&Datapath->HasBatchIo, 0);
-                    goto RecvFallback;
-                }
-
-                if (ErrNum != EAGAIN && ErrNum != EWOULDBLOCK) {
-                    QuicTraceEvent(
-                        DatapathErrorStatus,
-                        "[data][%p] ERROR, %u, %s.",
-                        SocketContext->Binding,
-                        ErrNum,
-                        "recvmsg_x failed");
-
-                    if (ErrNum == ECONNREFUSED ||
-                        ErrNum == EHOSTUNREACH ||
-                        ErrNum == ENETUNREACH) {
-                        if (!SocketContext->Binding->PcpBinding) {
-                            Datapath->UdpHandlers.Unreachable(
-                                SocketContext->Binding,
-                                SocketContext->Binding->ClientContext,
-                                &SocketContext->Binding->RemoteAddress);
-                        }
-                    }
-                }
             } else {
-                //
-                // Process received messages.
-                //
-                for (ssize_t i = 0; i < RecvCount; i++) {
-                    CxPlatSocketContextRecvComplete(
-                        SocketContext,
-                        &MsgVec[i].msg_hdr,
-                        RecvBlocks[i],
-                        (ssize_t)MsgVec[i].msg_datalen);
-                }
+                ssize_t RecvCount =
+                    recvmsg_x(
+                        SocketContext->SocketFd,
+                        MsgVec,
+                        (unsigned int)PreparedCount,
+                        MSG_DONTWAIT);
 
-                //
-                // Return unused recv blocks to the pool.
-                //
-                for (int i = (int)RecvCount; i < PreparedCount; i++) {
-                    CxPlatPoolFree(RecvBlocks[i]);
+                if (RecvCount < 0) {
+                    int ErrNum = errno;
+
+                    //
+                    // Return all allocated recv blocks to the pool.
+                    //
+                    for (int i = 0; i < PreparedCount; i++) {
+                        CxPlatPoolFree(RecvBlocks[i]);
+                    }
+
+                    if (ErrNum == ENOSYS) {
+                        //
+                        // recvmsg_x is not available on this kernel. Fall back to
+                        // recvmsg for this and all future calls.
+                        //
+                        InterlockedAnd(&Datapath->HasBatchIo, 0);
+                        UseRecvFallback = TRUE;
+                    } else {
+                        if (ErrNum != EAGAIN && ErrNum != EWOULDBLOCK) {
+                            QuicTraceEvent(
+                                DatapathErrorStatus,
+                                "[data][%p] ERROR, %u, %s.",
+                                SocketContext->Binding,
+                                ErrNum,
+                                "recvmsg_x failed");
+
+                            if (ErrNum == ECONNREFUSED ||
+                                ErrNum == EHOSTUNREACH ||
+                                ErrNum == ENETUNREACH) {
+                                if (!SocketContext->Binding->PcpBinding) {
+                                    Datapath->UdpHandlers.Unreachable(
+                                        SocketContext->Binding,
+                                        SocketContext->Binding->ClientContext,
+                                        &SocketContext->Binding->RemoteAddress);
+                                }
+                            }
+                        }
+
+                        //
+                        // Re-prepare the socket context for the next single recvmsg
+                        // (used by the fallback path and needed to keep CurrentRecvBlock
+                        // in a valid state).
+                        //
+                        CxPlatSocketContextReprepareReceive(SocketContext);
+                    }
+
+                } else {
+                    //
+                    // Process received messages.
+                    //
+                    for (ssize_t i = 0; i < RecvCount; i++) {
+                        CxPlatSocketContextRecvComplete(
+                            SocketContext,
+                            &MsgVec[i].msg_hdr,
+                            RecvBlocks[i],
+                            (ssize_t)MsgVec[i].msg_datalen);
+                    }
+
+                    //
+                    // Return unused recv blocks to the pool.
+                    //
+                    for (int i = (int)RecvCount; i < PreparedCount; i++) {
+                        CxPlatPoolFree(RecvBlocks[i]);
+                    }
+
+                    //
+                    // Re-prepare the socket context for the next single recvmsg
+                    // (used by the fallback path and needed to keep CurrentRecvBlock
+                    // in a valid state).
+                    //
+                    CxPlatSocketContextReprepareReceive(SocketContext);
                 }
             }
+        }
 
-RecvDone:
-            //
-            // Re-prepare the socket context for the next single recvmsg
-            // (used by the fallback path and needed to keep CurrentRecvBlock
-            // in a valid state).
-            //
-            CxPlatSocketContextReprepareReceive(SocketContext);
-
-        } else {
-RecvFallback:
+        if (UseRecvFallback) {
 #endif // DARWIN_USE_PRIVATE_MSGX_API
             //
             // Read up to 4 receives with individual recvmsg calls.
