@@ -226,6 +226,19 @@ Darwin syscall 번호는 존재한다.
 
 #### A. feature 플래그 정합성 복구
 
+상태:
+
+- [x] `CXPLAT_DATAPATH_FEATURE_SEND_DSCP`
+- [x] `CXPLAT_DATAPATH_FEATURE_RECV_DSCP`
+- [ ] `CXPLAT_DATAPATH_FEATURE_TTL`
+- [ ] `CXPLAT_DATAPATH_FEATURE_LOCAL_PORT_SHARING`
+
+메모:
+
+- `SEND_DSCP` / `RECV_DSCP`는 `Datapath->Features` 계산 경로를 추가해서 실제 지원 상태와 맞췄다.
+- `TTL`은 ancillary parsing helper와 관련 guard는 들어갔지만, dual-mode wildcard listener가 IPv4 TTL metadata를 truthfully 보장하지 못해서 feature advertising은 보류했다.
+- 이 작업을 진행하면서 pure IPv4 socket과 dual-mode listener 사이의 `sendmsg()` destination family 정합성 문제도 함께 수정했다.
+
 권장 항목:
 
 - `CXPLAT_DATAPATH_FEATURE_TTL`
@@ -247,6 +260,12 @@ Darwin syscall 번호는 존재한다.
 
 #### B. TTL/Hop Limit 수신 구현
 
+상태:
+
+- [ ] end-to-end 완료 아님
+- [x] IPv4 / IPv6 TTL ancillary parsing helper 추가
+- [ ] socket init에서 `IP_RECVTTL` / `IPV6_RECVHOPLIMIT`를 실제 enable하고 feature까지 advertise
+
 작업 포인트:
 
 - socket init에서 `IP_RECVTTL` / `IPV6_RECVHOPLIMIT` 설정
@@ -256,6 +275,10 @@ Darwin syscall 번호는 존재한다.
 이건 구현 난이도에 비해 확실한 품질 개선이다.
 
 #### C. `SO_RCVBUF` 복구
+
+상태:
+
+- [ ] 미완료
 
 현재 주석 처리된 `SO_RCVBUF` 설정을 되살리고, macOS에서 허용 가능한 상한으로 조정하면 된다.
 
