@@ -6,10 +6,11 @@
 
 핵심 결론은 다음과 같다.
 
-- 단기적으로는 충분히 개선 가능하다.
-- 특히 `feature` 플래그 정합성, TTL/Hop Limit 수신, 소켓 옵션 보강, receive buffer 설정은 저위험 대비 효과가 크다.
-- 반면 TCP parity, 다중 파티션 확장, macOS 전용 배치 I/O 도입은 별도 규모의 작업으로 봐야 한다.
-- `datapath_kqueue.c` 하나만 고쳐서는 해결되지 않는 제약도 있다. Darwin 공용 계층인 `src/platform/platform_posix.c`가 현재 macOS를 사실상 single-core 플랫폼으로 취급한다.
+- ~~단기적으로는 충분히 개선 가능하다.~~ 핵심 인프라 개선이 완료되어 실사용 가능한 UDP 구현 수준에 도달했다.
+- ~~특히 `feature` 플래그 정합성, TTL/Hop Limit 수신, 소켓 옵션 보강, receive buffer 설정은 저위험 대비 효과가 크다.~~ feature 플래그 정합성 복구 (`SEND_DSCP`, `RECV_DSCP`, `LOCAL_PORT_SHARING`), `SO_REUSEPORT`, 배치 I/O (`sendmsg_x`/`recvmsg_x`), 다중 파티션이 구현되었다.
+- ~~반면 TCP parity, 다중 파티션 확장, macOS 전용 배치 I/O 도입은 별도 규모의 작업으로 봐야 한다.~~ 다중 파티션과 배치 I/O는 해소됐고, TCP parity만 별도 프로젝트로 남아 있다.
+- ~~`datapath_kqueue.c` 하나만 고쳐서는 해결되지 않는 제약도 있다. Darwin 공용 계층인 `src/platform/platform_posix.c`가 현재 macOS를 사실상 single-core 플랫폼으로 취급한다.~~ `platform_posix.c`의 single-core 제약은 `pthread_cpu_number_np()` 도입으로 해소했다.
+- 남은 저비용 과제: TTL feature advertising end-to-end 완성, `SO_RCVBUF` 복구.
 
 ## 조사 범위
 
@@ -65,14 +66,11 @@
 
 - `src/platform/datapath_kqueue.c:1115`
 
-### 3. send batching은 사실상 비활성 상태
+### 3. send batching — ~~사실상 비활성 상태~~ 구현 완료 (macOS)
 
-파일 시작부터 batching TODO가 남아 있고, batch size가 1로 고정되어 있다.
+~~파일 시작부터 batching TODO가 남아 있고, batch size가 1로 고정되어 있다.~~
 
-- `src/platform/datapath_kqueue.c:46`
-- `src/platform/datapath_kqueue.c:48`
-
-이 상태에서는 send path가 `sendmsg()` 1회 중심으로 동작하며, Linux `epoll` 경로가 가진 `sendmmsg()` 기반 다중 메시지 전송이나 GSO 기반 큰 단위 전송과 비교하면 시스템콜 효율이 떨어진다.
+macOS에서 `CXPLAT_MAX_BATCH_SEND=16`으로 확대하고, connected 소켓에서는 `sendmsg_x`로 배치 전송, 비연결 소켓에서는 `sendmsg` 반복으로 버퍼별 데이터그램을 전송하도록 send path를 재작성했다. iOS에서는 `CXPLAT_MAX_BATCH_SEND=1`로 기존 동작을 유지한다.
 
 ### 4. TCP는 아직 포팅되지 않음
 
@@ -148,31 +146,17 @@ macOS는 동일 로직이 통째로 주석 처리되어 있다.
 
 고부하 수신 성능과 drop 회피 관점에서 바로 개선 가능한 항목이다.
 
-### 4. local port sharing / multi-socket fanout
+### 4. local port sharing / multi-socket fanout — ~~격차~~ 해소됨
 
-Linux는 `SO_REUSEPORT`를 활용해 server socket이나 공유 client socket을 확장한다.
+~~그러나 kqueue 경로에는 해당 설정이 없다. 게다가 datapath partition 수도 1로 고정되어 있다.~~
 
-- `src/platform/datapath_epoll.c:922`
+epoll 경로의 패턴을 이식하여 `SO_REUSEPORT`를 도입했다. 서버 소켓 또는 `CXPLAT_SOCKET_FLAG_SHARE` 플래그가 설정된 소켓에서 `PartitionCount > 1`이면 자동 설정된다. `CXPLAT_DATAPATH_FEATURE_LOCAL_PORT_SHARING` feature 플래그도 활성화했다.
 
-macOS SDK와 manpage도 `SO_REUSEPORT`를 지원한다.
+### 5. 다중 파티션 활용 — ~~불가~~ 구현 완료
 
-- `/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/sys/socket.h:137`
-- `man 2 setsockopt`
+~~macOS 공용 계층은 현재 프로세서 수를 1로 강제하고, 현재 processor index도 항상 0을 돌려준다.~~
 
-그러나 kqueue 경로에는 해당 설정이 없다. 게다가 datapath partition 수도 1로 고정되어 있다.
-
-- `src/platform/datapath_kqueue.c:475`
-
-즉, API는 있어도 현재 설계가 그 장점을 쓰지 못한다.
-
-### 5. 다중 파티션 활용 불가
-
-macOS 공용 계층은 현재 프로세서 수를 1로 강제하고, 현재 processor index도 항상 0을 돌려준다.
-
-- `src/platform/platform_posix.c:101`
-- `src/platform/platform_posix.c:527`
-
-이 제약 때문에 `datapath_kqueue.c`만 수정해서는 Linux 수준의 per-processor socket 모델을 곧바로 가져오기 어렵다.
+`platform_posix.c`에서 `CxPlatProcessorCount`를 `sysconf(_SC_NPROCESSORS_ONLN)`으로 복원하고, `CxPlatProcCurrentNumber()`에 `pthread_cpu_number_np()` (macOS 11.0+)를 도입했다. `datapath_kqueue.c`에서도 `PartitionCount`를 `CxPlatWorkerPoolGetCount(WorkerPool)`로 복원하고, `SO_REUSEPORT` 기반 다중 소켓 모델을 활성화했다.
 
 ## macOS에서 실제로 활용 가능한 API 단서
 
@@ -214,11 +198,26 @@ macOS에는 `connectx()`가 public API로 존재한다.
 
 ### 4. `sendmsg_x` / `recvmsg_x`
 
-Darwin syscall 번호는 존재한다.
+상태:
 
-- `/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/sys/syscall.h:520`
+- [x] 구현 완료 (macOS 전용, iOS 비활성)
 
-하지만 public prototype과 manpage는 제가 확인한 범위에서 바로 드러나지 않았다. upstream 품질 관점에서는 이 API에 기대는 설계보다, 우선 공용 `sendmsg()` 반복 및 recv chain 최적화로 접근하는 편이 안전하다.
+Darwin private syscall (`SYS_recvmsg_x=480`, `SYS_sendmsg_x=481`)로 공개 SDK에 프로토타입이 없다. `struct msghdr_x`와 함수 프로토타입을 `datapath_kqueue.c` 상단에 직접 선언해서 사용한다.
+
+**`recvmsg_x` (배치 수신)**:
+- `CXPLAT_MAX_BATCH_RECV=16`개 데이터그램을 1회 syscall로 수신.
+- ancillary data (pktinfo, TOS, TTL 등)를 정상 지원하므로 제약 없음.
+- `CxPlatSocketContextRecvComplete`를 리팩터링하여 명시적 `struct msghdr*`과 `DATAPATH_RX_IO_BLOCK*`을 받도록 변경.
+- 기존 4회 `recvmsg` 루프는 fallback 경로로 유지.
+
+**`sendmsg_x` (배치 송신)**:
+- `msg_name`과 `msg_control`을 모두 NULL로 강제하는 제약이 있다.
+- 따라서 **connected 소켓에서만** 사용 가능. TOS/DSCP는 `setsockopt`로 사전 설정.
+- 비연결 소켓은 기존 `sendmsg()` 반복으로 처리.
+
+**`ENOSYS` fallback**: 첫 호출에서 `ENOSYS`가 반환되면 `Datapath->HasBatchIo = FALSE`로 전환하여 이후 모든 호출에서 `sendmsg`/`recvmsg` 반복으로 폴백한다.
+
+**iOS 가드**: `#if !TARGET_OS_IPHONE`으로 전체 배치 I/O 경로를 비활성화. iOS에서는 `CXPLAT_MAX_BATCH_SEND=1`, `CXPLAT_MAX_BATCH_RECV=1`로 기존 동작을 유지한다.
 
 ## 실질적인 개선 우선순위
 
@@ -231,7 +230,7 @@ Darwin syscall 번호는 존재한다.
 - [x] `CXPLAT_DATAPATH_FEATURE_SEND_DSCP`
 - [x] `CXPLAT_DATAPATH_FEATURE_RECV_DSCP`
 - [ ] `CXPLAT_DATAPATH_FEATURE_TTL`
-- [ ] `CXPLAT_DATAPATH_FEATURE_LOCAL_PORT_SHARING`
+- [x] `CXPLAT_DATAPATH_FEATURE_LOCAL_PORT_SHARING`
 
 메모:
 
@@ -286,23 +285,25 @@ Darwin syscall 번호는 존재한다.
 
 #### A. `SO_REUSEPORT` 도입
 
-server socket 또는 `CXPLAT_SOCKET_FLAG_SHARE` 경로에 대해 `SO_REUSEPORT`를 적용할 수 있다.
+상태:
 
-현재 epoll 조건:
+- [x] 완료
 
-- `src/platform/datapath_epoll.c:925`
-
-kqueue에도 유사 정책을 이식하는 것은 가능해 보인다. 다만 실제 효과를 내기 위해서는 partition 모델과 함께 검토해야 한다.
+epoll 경로의 패턴을 이식했다. 서버 소켓 또는 `CXPLAT_SOCKET_FLAG_SHARE` 플래그가 설정된 소켓에서 `PartitionCount > 1`이면 `SO_REUSEPORT`를 설정한다. `CXPLAT_SOCKET` 구조체에 `SharedBinding` 비트필드를 추가해서 `Config->Flags`의 정보를 `CxPlatSocketContextInitialize`까지 전달한다.
 
 #### B. send batching 개선
 
-현실적인 방향:
+상태:
 
-- `CXPLAT_MAX_BATCH_SEND`를 늘리고
-- 내부적으로 여러 message를 queue에 보관한 뒤
-- `sendmsg()` 반복 또는 공용 shim 방식으로 flush
+- [x] 완료 (macOS), iOS에서는 기존 동작 유지
 
-Linux의 `sendmmsg`처럼 완전히 같을 필요는 없지만, syscall 수를 줄이는 효과는 얻을 수 있다.
+`CXPLAT_MAX_BATCH_SEND`를 16으로 확대하고 `CxPlatSocketSendInternal`의 send 경로를 재작성했다.
+
+- **connected 소켓**: `sendmsg_x`로 다중 데이터그램을 1회 syscall로 전송. TOS/DSCP는 `setsockopt`로 사전 설정.
+- **비연결 소켓**: 버퍼별 `sendmsg()` 반복 (ancillary data 필요).
+- **EAGAIN 시**: `CurrentIndex`로 부분 전송 상태를 추적하여 pended send에서 이어서 전송.
+- **`ENOSYS` fallback**: `sendmsg_x` 미지원 시 `HasBatchIo = FALSE`로 전환하여 이후 `sendmsg` 반복으로 폴백.
+- **iOS**: `#if TARGET_OS_IPHONE`으로 배치 경로를 비활성화하고, `CXPLAT_MAX_BATCH_SEND=1`로 기존 단일 버퍼 동작을 유지.
 
 ### 3단계: 별도 프로젝트로 봐야 할 항목
 
@@ -328,13 +329,17 @@ Linux의 `sendmmsg`처럼 완전히 같을 필요는 없지만, syscall 수를 �
 
 #### B. multi-partition / per-processor scaling
 
-이건 `datapath_kqueue.c` 단독 작업이 아니라 아래까지 포함한다.
+상태:
 
-- `src/platform/platform_posix.c`
-- worker pool / ideal processor 가정
-- macOS에서 실제 CPU affinity / current CPU 추적 가능성 재검토
+- [x] 완료
 
-현재 플랫폼 계층이 macOS를 single-core처럼 취급하고 있어서, 여기부터 설계를 다시 세워야 한다.
+다음 세 곳을 수정해서 macOS에서 다중 파티션을 활성화했다.
+
+1. **`src/platform/platform_posix.c` — 프로세서 카운트**: macOS 분기의 `CxPlatProcessorCount = 1` 하드코딩을 제거하고, Linux와 동일하게 `sysconf(_SC_NPROCESSORS_ONLN)`을 사용하도록 통합했다.
+2. **`src/platform/platform_posix.c` — 현재 CPU 번호**: `CxPlatProcCurrentNumber()`의 macOS 분기에서 `return 0` 대신 `pthread_cpu_number_np()` (macOS 11.0+)를 사용한다. 이 API는 approximate하지만 파티션 배정 힌트로만 쓰이므로 correctness에 영향 없다.
+3. **`src/platform/datapath_kqueue.c` — 파티션 카운트**: `Datapath->PartitionCount = 1` 하드코딩을 `CxPlatWorkerPoolGetCount(WorkerPool)`로 복원했다.
+
+결과적으로 macOS에서도 CPU 코어 수만큼 워커 스레드와 datapath 파티션이 생성되며, 서버 소켓은 `SO_REUSEPORT`로 파티션별 소켓을 공유한다. 스레드 어피니티(`thread_policy_set`)는 macOS에서 커널이 무시할 수 있어 별도 후속 작업으로 분리했다.
 
 ## 가능/불가능 요약
 
@@ -380,19 +385,21 @@ Linux의 `sendmmsg`처럼 완전히 같을 필요는 없지만, syscall 수를 �
 
 ## 최종 결론
 
-`datapath_kqueue.c`는 당장 폐기할 정도로 빈약한 파일은 아니다. UDP 기반의 기본 기능은 갖췄다. 다만 현재는 "최소 동작 구현"에 더 가깝고, Linux `epoll` 경로와 비교하면 다음 세 층위의 차이가 있다.
+`datapath_kqueue.c`는 ~~당장 폐기할 정도로 빈약한 파일은 아니다. UDP 기반의 기본 기능은 갖췄다. 다만 현재는 "최소 동작 구현"에 더 가깝고,~~ 다중 파티션, 배치 I/O, `SO_REUSEPORT` 등 핵심 인프라가 구현된 상태다. Linux `epoll` 경로와 비교하면 다음 층위의 차이가 남아 있다.
 
-- 저비용 누락: feature flags, TTL, `SO_RCVBUF`
-- 중간 규모 격차: `SO_REUSEPORT`, batching
-- 대규모 미구현: TCP, multi-partition scaling
+- 저비용 누락: ~~feature flags,~~ TTL feature advertising, `SO_RCVBUF`
+- ~~중간 규모 격차: `SO_REUSEPORT`, batching~~ → 해소됨
+- ~~대규모 미구현: TCP, multi-partition scaling~~ → multi-partition 해소, TCP만 잔존
+- 잔존 대규모 미구현: TCP 포팅
 
 가장 현실적인 개선 전략은 아래 순서다.
 
-1. feature advertising 정리
-2. TTL/HopLimit 수신 구현
+1. ~~feature advertising 정리~~ → 완료 (`SEND_DSCP`, `RECV_DSCP`, `LOCAL_PORT_SHARING`)
+2. TTL/HopLimit 수신 end-to-end 완성 (feature advertising 포함)
 3. `SO_RCVBUF` 복구
-4. `SO_REUSEPORT` 실험적 도입
-5. batching 개선
-6. TCP 및 multi-partition 재설계
+4. ~~`SO_REUSEPORT` 실험적 도입~~ → 완료
+5. ~~batching 개선~~ → 완료 (`sendmsg_x`/`recvmsg_x` + `sendmsg` 반복 폴백)
+6. ~~multi-partition 재설계~~ → 완료 (`pthread_cpu_number_np` + 파티션 카운트 복원)
+7. TCP 포팅
 
-이 순서라면 risk 대비 효과가 좋고, macOS datapath를 "기본 동작" 수준에서 "실사용 가능한 UDP 구현" 수준까지는 비교적 짧은 작업으로 끌어올릴 수 있다.
+macOS datapath는 "실사용 가능한 UDP 구현" 수준에 도달했다. 남은 핵심 과제는 TTL feature advertising 완성과 TCP 포팅이다.
