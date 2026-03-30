@@ -2287,11 +2287,21 @@ CxPlatSocketSendInternal(
         SendData->BufferCount - SendData->CurrentIndex > 1) {
 
         int Tos = SendData->ECN | (SendData->DSCP << 2);
-        setsockopt(
-            SocketContext->SocketFd,
-            UseIpv4Socket ? IPPROTO_IP : IPPROTO_IPV6,
-            UseIpv4Socket ? IP_TOS : IPV6_TCLASS,
-            &Tos, sizeof(Tos));
+        if (setsockopt(
+                SocketContext->SocketFd,
+                UseIpv4Socket ? IPPROTO_IP : IPPROTO_IPV6,
+                UseIpv4Socket ? IP_TOS : IPV6_TCLASS,
+                &Tos,
+                sizeof(Tos)) == SOCKET_ERROR) {
+            Status = errno;
+            QuicTraceEvent(
+                DatapathErrorStatus,
+                "[data][%p] ERROR, %u, %s.",
+                SocketContext->Binding,
+                Status,
+                "setsockopt(IP_TOS/IPV6_TCLASS) failed");
+            goto SendFallback;
+        }
 
         uint32_t Remaining = SendData->BufferCount - SendData->CurrentIndex;
         struct msghdr_x MsgVec[CXPLAT_MAX_BATCH_SEND];
