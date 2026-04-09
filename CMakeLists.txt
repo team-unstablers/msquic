@@ -78,7 +78,7 @@ endif()
 if (WIN32)
     set(QUIC_TLS_LIB "schannel" CACHE STRING "TLS Library to use")
 else()
-    set(QUIC_TLS_LIB "quictls" CACHE STRING "TLS Library to use")
+    set(QUIC_TLS_LIB "openssl" CACHE STRING "TLS Library to use")
 endif()
 
 option(QUIC_BUILD_TOOLS "Builds the tools code" OFF)
